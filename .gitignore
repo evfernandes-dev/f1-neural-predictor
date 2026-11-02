@@ -7,5 +7,3 @@ venv/
 .DS_Store
 Thumbs.db
 *.csv
-.pytest_cache/
-.ruff_cache/

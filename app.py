@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 import plotly.express as px
@@ -6,7 +6,9 @@ import streamlit as st
 
 from predictor import OpenF1Error, run_analysis
 
+# Configuração básica da página: título da aba, ícone e layout largo.
 st.set_page_config(page_title="F1 Neural Predictor", page_icon="🏎️", layout="wide")
+# Um cartão no topo só pra dar personalidade ao painel.
 st.html("""
 <style>
 .block-container{max-width:1180px;padding-top:2.5rem}
@@ -23,14 +25,16 @@ border:1px solid #3a3f4a;box-shadow:0 18px 55px rgba(0,0,0,.30);margin-bottom:18
 """)
 
 
+# Guarda o resultado por 1 hora, pra não baixar tudo de novo a cada clique.
 @st.cache_data(show_spinner=False, ttl=3600)
 def cached_analysis(start_year: int, end_year: int, recent_races: int):
     return run_analysis(start_year, end_year, recent_races)
 
+# Controles da barra lateral.
 with st.sidebar:
     st.header("Configuração")
     start = st.number_input("Treinar desde", 2023, 2035, 2023)
-    end = st.number_input("Treinar até", 2023, 2035, min(datetime.now().year, 2035))
+    end = st.number_input("Treinar até", 2023, 2035, min(datetime.now(timezone.utc).year, 2035))
     recent = st.slider(
         "Corridas consideradas na forma recente",
         3, 12, 6,
@@ -51,6 +55,7 @@ if run:
             st.error(str(exc))
             st.stop()
 
+    # O resultado já vem ordenado, então a primeira linha é o favorito.
     leader = result.iloc[0]
     a, b, c, d = st.columns([1.9, 0.9, 1, 0.9])
     a.metric("Favorito", leader["piloto"])
@@ -59,6 +64,7 @@ if run:
     d.metric("Registros limpos", len(dataset))
 
     st.subheader("Probabilidades de vitória")
+    # Barras na horizontal: fica mais fácil ler os nomes dos pilotos.
     chart = px.bar(result.head(10), x="probabilidade", y="piloto", orientation="h",
                    color="probabilidade", color_continuous_scale=["#5b111a", "#ff203b"],
                    labels={"probabilidade":"Probabilidade (%)", "piloto":"Piloto"})
@@ -67,6 +73,7 @@ if run:
                         yaxis={"categoryorder":"total ascending"})
     st.plotly_chart(chart)
 
+    # A avaliação fica escondida pra não poluir a tela.
     with st.expander("Avaliação do modelo", expanded=False):
         cols = st.columns(4)
         cols[0].metric("Vencedor por corrida", f'{metrics["top1"]:.0%}')
@@ -88,11 +95,19 @@ if run:
             "não vencem uma determinada corrida."
         )
 
-    st.dataframe(result.rename(columns={"piloto":"Piloto", "equipe":"Equipe",
-        "media_posicao_5":"Posição média", "vitorias_5":"Taxa de vitórias",
-        "podios_5":"Taxa de pódios", "top5_5":"Taxa de top 5",
-        "abandono_5":"Taxa de abandono", "media_pontos_5":"Média de pontos",
-        "probabilidade":"Probabilidade (%)"}), hide_index=True)
+    # Deixa os nomes das colunas mais fáceis de entender.
+    tabela = result.rename(columns={
+        "piloto": "Piloto",
+        "equipe": "Equipe",
+        "media_posicao_5": "Posição média",
+        "vitorias_5": "Taxa de vitórias",
+        "podios_5": "Taxa de pódios",
+        "top5_5": "Taxa de top 5",
+        "abandono_5": "Taxa de abandono",
+        "media_pontos_5": "Média de pontos",
+        "probabilidade": "Probabilidade (%)",
+    })
+    st.dataframe(tabela, hide_index=True)
     st.download_button("Baixar CSV", result.to_csv(index=False).encode("utf-8"),
                        "probabilidades_f1.csv", "text/csv")
     st.info(

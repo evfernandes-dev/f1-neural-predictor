@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 from datetime import datetime
 from functools import lru_cache
@@ -24,10 +22,12 @@ from sklearn.preprocessing import StandardScaler
 
 BASE_URL = "https://api.openf1.org/v1"
 JOLPICA_URL = "https://api.jolpi.ca/ergast/f1"
+# As colunas que a rede neural usa pra aprender.
 FEATURES = [
     "media_posicao_5", "vitorias_5", "podios_5", "top5_5",
     "abandono_5", "media_pontos_5",
 ]
+# Pontos por posição (tabela padrão da F1).
 POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
 
 
@@ -49,6 +49,8 @@ def _request_json(url: str) -> tuple[dict, ...]:
     """Consulta a API com cache e novas tentativas para evitar HTTP 429."""
     request = Request(url, headers={"User-Agent": "f1-neural-predictor/1.0"})
     max_retries = 4
+    # A API às vezes bloqueia por excesso de pedidos (erro 429).
+    # Aqui a gente espera um pouco e tenta de novo antes de desistir.
     for attempt in range(max_retries + 1):
         try:
             with urlopen(request, timeout=30) as response:
@@ -121,8 +123,8 @@ def _collect_openf1_data(start_year: int, end_year: int) -> list[dict]:
                 for result in results
                 if result.get("driver_number") is not None
             }
-            # Pilotos que entraram no meio da temporada não aparecem na sessão
-            # mais recente. Busca os nomes extras apenas quando necessário.
+            # Quem entrou no meio da temporada não aparece na última corrida,
+            # então buscamos de novo só quando falta alguém.
             if numbers - drivers.keys():
                 drivers.update({
                     int(d["driver_number"]): d
@@ -202,8 +204,7 @@ def collect_data(start_year: int, end_year: int, recent_races: int = 5) -> pd.Da
     try:
         rows = _collect_openf1_data(start_year, end_year)
     except OpenF1Error:
-        # A OpenF1 pode responder 404, 429 ou exigir acesso temporariamente.
-        # A fonte reserva fornece os mesmos resultados finais necessários ao modelo.
+        # Se a OpenF1 falhar, a Jolpica entra no lugar com os mesmos resultados.
         rows = _collect_jolpica_data(start_year, end_year)
     if not rows:
         rows = _collect_jolpica_data(start_year, end_year)
@@ -217,6 +218,7 @@ def clean_and_engineer(data: pd.DataFrame, recent_races: int = 5) -> pd.DataFram
     df = data.copy()
     df = df.drop_duplicates(["ano", "corrida", "piloto_id"], keep="last")
     df["posicao"] = pd.to_numeric(df["posicao"], errors="coerce")
+    # Quem não terminou a corrida conta como abandono.
     df["abandono"] = (df["posicao"].isna() | df["abandono_api"].fillna(False)).astype(int)
     df["posicao"] = df["posicao"].fillna(20).clip(1, 20)
     df["venceu"] = (df["posicao"] == 1).astype(int)
@@ -236,7 +238,8 @@ def clean_and_engineer(data: pd.DataFrame, recent_races: int = 5) -> pd.DataFram
         ("podio", "podios_5"), ("top5", "top5_5"),
         ("abandono", "abandono_5"), ("pontos", "media_pontos_5"),
     ]:
-        # shift(1) impede que o resultado previsto entre nas próprias variáveis.
+        # shift(1) é o pulo do gato: cada linha só enxerga corridas anteriores,
+        # nunca o resultado da corrida que está sendo prevista.
         df[target] = grouped[source].transform(
             lambda values: values.shift(1).rolling(window, min_periods=minimum).mean()
         )
@@ -260,7 +263,8 @@ def train_model(df: pd.DataFrame):
     if df["prova"].nunique() < 2:
         raise OpenF1Error("São necessárias pelo menos duas corridas para treinar e testar.")
 
-    # Divide por corrida: as últimas 20% das provas ficam para teste.
+    # 80% das corridas pra treinar e 20% pra testar.
+    # O teste vira uma "corrida nova" que o modelo nunca viu.
     races = df[["prova", "data"]].drop_duplicates().sort_values("data")
     split = max(int(len(races) * 0.8), 1)
     if split >= len(races):
@@ -271,9 +275,10 @@ def train_model(df: pd.DataFrame):
     test = df[df["prova"].isin(test_ids)].copy()
 
     winners = train[train["venceu"] == 1]
-    # Reforça os raros casos de vitória para reduzir o desbalanceamento.
+    # Vitória é rara; repetir os vencedores ajuda a rede a não prever só "não".
     balanced = pd.concat([train, *([winners] * 8)], ignore_index=True)
 
+    # Rede pequena de propósito: uma camada escondida com 8 neurônios.
     model = Pipeline([
         ("escala", StandardScaler()),
         ("rede_neural", MLPClassifier(
@@ -350,7 +355,7 @@ def predict_next_race(df: pd.DataFrame, model: Pipeline, recent_races: int) -> p
     total = float(np.sum(raw))
     if total <= 0 or not np.isfinite(total):
         raise OpenF1Error("O modelo não gerou probabilidades válidas. Tente ampliar o período.")
-    # Em cada GP existe um vencedor; normalização facilita a leitura do painel.
+    # Só um piloto vence por GP; normalizar faz as probabilidades somarem 100%.
     latest["probabilidade"] = raw / total * 100
     return latest[["piloto", "equipe", *FEATURES, "probabilidade"]].sort_values(
         "probabilidade", ascending=False
@@ -358,6 +363,7 @@ def predict_next_race(df: pd.DataFrame, model: Pipeline, recent_races: int) -> p
 
 
 def run_analysis(start_year: int, end_year: int, recent_races: int):
+    # O caminho completo: baixar os dados, treinar e prever.
     dataset = collect_data(start_year, end_year, recent_races)
     model, metrics = train_model(dataset)
     probabilities = predict_next_race(dataset, model, recent_races)
