@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from functools import lru_cache
 from time import sleep
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
-import json
 
 import numpy as np
 import pandas as pd
@@ -21,7 +21,6 @@ from sklearn.metrics import (
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-
 
 BASE_URL = "https://api.openf1.org/v1"
 JOLPICA_URL = "https://api.jolpi.ca/ergast/f1"
@@ -116,7 +115,20 @@ def _collect_openf1_data(start_year: int, end_year: int) -> list[dict]:
         }
         for race_number, race in enumerate(races, start=1):
             session_key = race["session_key"]
-            for result in _get("session_result", session_key=session_key):
+            results = _get("session_result", session_key=session_key)
+            numbers = {
+                int(result["driver_number"])
+                for result in results
+                if result.get("driver_number") is not None
+            }
+            # Pilotos que entraram no meio da temporada não aparecem na sessão
+            # mais recente. Busca os nomes extras apenas quando necessário.
+            if numbers - drivers.keys():
+                drivers.update({
+                    int(d["driver_number"]): d
+                    for d in _get("drivers", session_key=session_key)
+                })
+            for result in results:
                 number = result.get("driver_number")
                 if number is None:
                     continue
@@ -212,6 +224,9 @@ def clean_and_engineer(data: pd.DataFrame, recent_races: int = 5) -> pd.DataFram
     df["top5"] = (df["posicao"] <= 5).astype(int)
     df["pontos"] = df["posicao"].map(POINTS).fillna(0).astype(float)
     df = df.sort_values(["data", "piloto_id"]).reset_index(drop=True)
+    # Identifica cada corrida para separar treino e teste sem misturar pilotos
+    # da mesma prova entre os dois conjuntos.
+    df["prova"] = df["ano"].astype(str) + "-" + df["corrida"].astype(str)
 
     window = max(int(recent_races), 1)
     minimum = min(3, window)
@@ -228,12 +243,33 @@ def clean_and_engineer(data: pd.DataFrame, recent_races: int = 5) -> pd.DataFram
     return df.dropna(subset=FEATURES).reset_index(drop=True)
 
 
+def _winner_hit_rate(df: pd.DataFrame, probability_column: str) -> float:
+    """Percentual de corridas em que o favorito escolhido venceu de fato."""
+    if df.empty:
+        return 0.0
+    hits = []
+    for _, race in df.groupby("prova", sort=False):
+        top = race.sort_values(probability_column).iloc[-1]
+        hits.append(int(top["venceu"]))
+    return float(np.mean(hits)) if hits else 0.0
+
+
 def train_model(df: pd.DataFrame):
     if len(df) < 40 or df["venceu"].nunique() < 2:
         raise OpenF1Error("Ainda não existem corridas suficientes para treinar o modelo.")
+    if df["prova"].nunique() < 2:
+        raise OpenF1Error("São necessárias pelo menos duas corridas para treinar e testar.")
 
-    split = max(int(len(df) * 0.8), 1)
-    train, test = df.iloc[:split], df.iloc[split:]
+    # Divide por corrida: as últimas 20% das provas ficam para teste.
+    races = df[["prova", "data"]].drop_duplicates().sort_values("data")
+    split = max(int(len(races) * 0.8), 1)
+    if split >= len(races):
+        split = len(races) - 1
+    train_ids = set(races.iloc[:split]["prova"])
+    test_ids = set(races.iloc[split:]["prova"])
+    train = df[df["prova"].isin(train_ids)]
+    test = df[df["prova"].isin(test_ids)].copy()
+
     winners = train[train["venceu"] == 1]
     # Reforça os raros casos de vitória para reduzir o desbalanceamento.
     balanced = pd.concat([train, *([winners] * 8)], ignore_index=True)
@@ -241,14 +277,15 @@ def train_model(df: pd.DataFrame):
     model = Pipeline([
         ("escala", StandardScaler()),
         ("rede_neural", MLPClassifier(
-            hidden_layer_sizes=(16, 8), activation="relu", solver="adam",
-            alpha=0.01, max_iter=800, random_state=42, early_stopping=True,
+            hidden_layer_sizes=(8,), activation="relu", solver="adam",
+            alpha=0.001, max_iter=2000, random_state=42, early_stopping=False,
         )),
     ])
     model.fit(balanced[FEATURES], balanced["venceu"])
 
+    test["probabilidade_teste"] = model.predict_proba(test[FEATURES])[:, 1]
     prediction = model.predict(test[FEATURES])
-    probability = model.predict_proba(test[FEATURES])[:, 1]
+    probability = test["probabilidade_teste"].to_numpy()
     metrics = {
         "acuracia": accuracy_score(test["venceu"], prediction),
         "precisao": precision_score(test["venceu"], prediction, zero_division=0),
@@ -256,21 +293,57 @@ def train_model(df: pd.DataFrame):
         "f1": f1_score(test["venceu"], prediction, zero_division=0),
         "auc": roc_auc_score(test["venceu"], probability) if test["venceu"].nunique() == 2 else None,
         "matriz": confusion_matrix(test["venceu"], prediction, labels=[0, 1]).tolist(),
+        "top1": _winner_hit_rate(test, "probabilidade_teste"),
+        "baseline": _winner_hit_rate(test, "media_pontos_5"),
+        "corridas_teste": int(test["prova"].nunique()),
         "treino": len(train),
         "teste": len(test),
     }
     return model, metrics
 
 
-def predict_next_race(df: pd.DataFrame, model: Pipeline, recent_races: int) -> pd.DataFrame:
-    latest = (
-        df.sort_values("data").groupby("piloto", as_index=False).tail(1).copy()
-    )
+def _next_race_features(df: pd.DataFrame, recent_races: int) -> pd.DataFrame:
+    """Monta as features do próximo GP usando as últimas corridas de cada piloto.
+
+    No treino, shift(1) evita usar o resultado da própria corrida. Na previsão,
+    porém, a corrida mais recente já terminou e deve entrar na conta.
+    """
+    window = max(int(recent_races), 1)
+    minimum = min(3, window)
     latest_year = df["ano"].max()
     season = df[df["ano"] == latest_year]
     cutoff = season["corrida"].max() - recent_races + 1
     active_names = season.loc[season["corrida"] >= cutoff, "piloto"].unique()
-    latest = latest[latest["piloto"].isin(active_names)]
+
+    recent = (
+        df[df["piloto"].isin(active_names)]
+        .sort_values(["piloto", "data"])
+        .groupby("piloto", sort=False)
+        .tail(window)
+    )
+    counts = recent.groupby("piloto").size()
+    recent = recent[recent["piloto"].isin(counts[counts >= minimum].index)]
+
+    features = recent.groupby("piloto", sort=False).agg(
+        media_posicao_5=("posicao", "mean"),
+        vitorias_5=("venceu", "mean"),
+        podios_5=("podio", "mean"),
+        top5_5=("top5", "mean"),
+        abandono_5=("abandono", "mean"),
+        media_pontos_5=("pontos", "mean"),
+    )
+    teams = (
+        recent.sort_values("data")
+        .groupby("piloto", sort=False)
+        .tail(1)
+        .set_index("piloto")["equipe"]
+    )
+    features["equipe"] = teams
+    return features.reset_index()
+
+
+def predict_next_race(df: pd.DataFrame, model: Pipeline, recent_races: int) -> pd.DataFrame:
+    latest = _next_race_features(df, recent_races)
     if latest.empty:
         raise OpenF1Error("Nenhum piloto ativo foi encontrado nas corridas recentes.")
     raw = model.predict_proba(latest[FEATURES])[:, 1]
