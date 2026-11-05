@@ -3,24 +3,22 @@
 [![Python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-A simple Streamlit app that estimates each driver's chance of winning the next
-Formula 1 race. It downloads race results, builds recent-form features, and
-trains a small neural network with scikit-learn.
+Streamlit app that estimates each driver's chance of winning the next Formula 1 race. It downloads race results, builds recent-form features and trains a small neural network with scikit-learn.
 
-This is an educational project. The probabilities are not betting advice.
+> Educational project. The probabilities are not betting advice.
 
-![F1 Neural Predictor app](docs/screenshot.png)
+![F1 Neural Predictor](docs/screenshot.png)
 
 ## What the app does
 
 - Shows the win probability for every active driver.
-- Checks the model by race: did the top pick win? (top-1)
-- Compares the model with a simple baseline based on average points.
-- Lets you download the table as a CSV.
+- Checks the model by race: did the top pick win?
+- Compares the model with a simple average-points baseline.
+- Lets you download the table as CSV.
 
-## How to run
+## Running
 
-You need Python 3.12 or newer.
+Requires Python 3.12+.
 
 ```powershell
 python -m venv .venv
@@ -29,47 +27,36 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-On Linux or macOS, activate the environment with `source .venv/bin/activate`.
+On Linux or macOS, use `source .venv/bin/activate`.
 
-Open `http://localhost:8501`, choose the period in the sidebar, and click
-**Treinar e prever** (Train and predict). The first run downloads the data and
-can take a few minutes.
+Open `http://localhost:8501`, choose the period in the sidebar and click **Treinar e prever**. The first run downloads the data and may take a few minutes.
 
 ## How it works
 
-1. **Download:** get the results of completed races from OpenF1. If OpenF1
-   fails, the app uses Jolpica as a backup.
-2. **Recent form:** for each driver, average their last races (position, wins,
-   podiums, top 5 finishes, retirements, and points).
-3. **Train:** a small neural network learns which drivers won. It only uses
-   data from earlier races, so the race being predicted is not included.
-4. **Predict:** the model gives a score to each driver. The app then turns the
-   scores into percentages that add up to 100%.
+1. **Download:** completed race results from OpenF1, with Jolpica as a fallback.
+2. **Recent form:** for each driver, average the last races (position, wins, podiums, top 5, retirements and points).
+3. **Train:** a small neural network learns which drivers won, using only earlier races.
+4. **Predict:** the model scores each driver and converts the scores to percentages that add up to 100%.
 
-The model trains on 80% of the races and tests on the last 20%. Races are kept
-whole, so drivers from the same race never appear in both sets.
+The model trains on 80% of races and tests on the last 20%. Races are kept whole, so the same race never appears in both sets.
 
-## Project structure
+## Structure
 
 ```text
-f1-neural-predictor/
-├── app.py                    # Streamlit app
-├── predictor.py              # data, model, and prediction
-├── docs/screenshot.png       # app screenshot
-├── .streamlit/config.toml    # dark theme
+├── app.py                    Streamlit app
+├── predictor.py              Data, model and prediction
+├── docs/screenshot.png
+├── .streamlit/config.toml    Dark theme
 ├── requirements.txt
-├── LICENSE
-└── README.md
+└── LICENSE
 ```
 
 ## Limitations
 
 - Free OpenF1 data starts mainly in 2023.
-- The model does not use qualifying, circuit, weather, or car updates.
-- These probabilities are an educational estimate, not a guarantee.
+- The model does not use qualifying, circuit, weather or car updates.
+- The app interface and code comments are in Portuguese.
 
-## Tech stack
+## Stack
 
-Python, pandas, NumPy, scikit-learn, Streamlit, Plotly, OpenF1, and Jolpica.
-
-The app interface and code comments are in Portuguese.
+Python, pandas, NumPy, scikit-learn, Streamlit, Plotly, OpenF1 and Jolpica.
